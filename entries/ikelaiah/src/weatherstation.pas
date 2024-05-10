@@ -11,8 +11,7 @@ uses
   , bufstream
   //, lgHashMap
   , generics.Collections
-  , csvdocument
-  , csvdataset
+  , mormot.core.buffers
   {$IFDEF DEBUG}
   , Stopwatch
   {$ENDIF}
@@ -56,8 +55,6 @@ type
     procedure CreateLookupTemp;
     procedure ReadMeasurements;
     procedure ReadMeasurementsBuffered;
-    procedure ReadMeasurementsV2;
-    procedure ReadMeasurementsV3;
     procedure ParseStationAndTemp(const line: shortstring);
     procedure AddCityTemperatureLG(const cityName: shortstring; const newTemp: int64);
     procedure SortWeatherStationAndStats;
@@ -352,111 +349,19 @@ begin
   end;
 end;
 
-{TCSVDocument Method. Easiest to use. About 2 times slower then the first method.}
-procedure TWeatherStation.ReadMeasurementsV2;
-var
-  fileStream: TFileStream;
-  buffStream: TReadBufStream;
-  csvReader: TCSVDocument;
-  index, totalLines, parsedTemp: int64;
-begin
-  totalLines := 0;
-  fileStream := TFileStream.Create(self.fname, fmOpenRead);
-  try
-    buffStream := TReadBufStream.Create(fileStream, 65536);
-    try
-      csvReader := TCSVDocument.Create;
-      try
-        csvReader.Delimiter := ';';
-        csvReader.LoadFromStream(buffStream);
 
-        totalLines := csvReader.RowCount;
-
-        for index := 0 to totalLines - 1 do
-        begin
-          if self.lookupStrFloatToIntList.TryGetValue(csvReader.Cells[1, index],
-            parsedTemp) then
-          begin
-            self.AddCityTemperatureLG(csvReader.Cells[0, index], parsedTemp);
-          end;
-        end;
-
-      finally
-        csvReader.Free;
-      end;
-    finally
-      buffStream.Free;
-    end;
-  finally
-  end;
-  fileStream.Free;
-end;
-
-{This method is twice times slower than the first one.}
-procedure TWeatherStation.ReadMeasurementsV3;
-var
-  fileStream: TFileStream;
-  buffStream: TReadBufStream;
-  csvDataset: TCSVDataset;
-  parsedTemp: int64;
-begin
-  fileStream := TFileStream.Create(self.fname, fmOpenRead);
-  try
-    buffStream := TReadBufStream.Create(fileStream);
-    try
-      csvDataset := TCSVDataset.Create(nil);
-      try
-        csvDataset.CSVOptions.Delimiter := ';';
-        csvDataset.CSVOptions.FirstLineAsFieldNames := False;
-        csvDataset.LoadFromCSVStream(buffStream);
-
-        // Move to first record
-        csvDataset.First;
-
-        while not csvDataset.EOF do
-        begin
-          // WriteLn('Field1 is ', csvDataset.Fields[0].AsString, ' and Field2 is ', csvDataset.Fields[1].AsString);
-          if self.lookupStrFloatToIntList.TryGetValue(csvDataset.Fields[1].AsString, parsedTemp) then
-          begin
-            self.AddCityTemperatureLG(csvDataset.Fields[0].AsString, parsedTemp);
-          end;
-          csvDataset.Next;
-        end;
-      finally
-        csvDataset.Free;
-      end;
-    finally
-      buffStream.Free;
-    end;
-  finally
-  end;
-  fileStream.Free;
-end;
-
-{This aproach is surprisingly 10 seconds slower than the first one.}
 procedure TWeatherStation.ReadMeasurementsBuffered;
 var
-  fileStream: TBufferedFileStream;
-  streamReader: TStreamReader;
+  mmapText:TMemoryMapText;
+  index:int64;
+
 begin
 
-  // Open the file for reading
-  fileStream := TBufferedFileStream.Create(self.fname, fmOpenRead);
-  try
-    streamReader := TStreamReader.Create(fileStream);
-    try
-      // Read and parse chunks of data until EOF -------------------------------
-      while not streamReader.EOF do
-      begin
-        self.ParseStationAndTemp(streamReader.ReadLine);
-        self.ParseStationAndTemp(streamReader.ReadLine);
-      end;// End of read and parse chunks of data ------------------------------
-    finally
-      streamReader.Free;
-    end;
-  finally
-    // Close the file
-    fileStream.Free;
+  mmapText := TMemoryMapText.Create(self.fname);
+
+  for index:=0 to mmapText.Count-1 do
+  begin
+    self.ParseStationAndTemp(mmapText.Strings[index]);
   end;
 end;
 
@@ -465,10 +370,8 @@ end;
 procedure TWeatherStation.ProcessMeasurements;
 begin
   self.CreateLookupTemp;
-  self.ReadMeasurements;
-  //self.ReadMeasurementsBuffered;
-  //self.ReadMeasurementsV2;
-  //self.ReadMeasurementsV3;
+  //self.ReadMeasurements;
+  self.ReadMeasurementsBuffered;
   self.SortWeatherStationAndStats;
   self.PrintSortedWeatherStationAndStats;
 end;

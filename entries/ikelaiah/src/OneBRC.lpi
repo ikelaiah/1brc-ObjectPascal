@@ -100,6 +100,11 @@
     <RunParams>
       <FormatVersion Value="2"/>
     </RunParams>
+    <RequiredPackages Count="1">
+      <Item1>
+        <PackageName Value="mormot2"/>
+      </Item1>
+    </RequiredPackages>
     <Units Count="3">
       <Unit0>
         <Filename Value="OneBRC.lpr"/>
