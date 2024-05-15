@@ -12,37 +12,13 @@ uses
   //, lgHashMap
   , generics.Collections
   , mormot.core.buffers
+  , mormot.core.os
+  , mormot.core.collections
+
   {$IFDEF DEBUG}
   , Stopwatch
   {$ENDIF}
-  , Baseline.Common;
-
-type
-  { Create a record of temperature stats.
-
-    Borrowed the concept from go's approach to improve performance, save floats as int64.
-    This saved ~2 mins processing time for processing 1 billion rows.}
-  TStat = record
-  var
-    min: int64;
-    max: int64;
-    sum: int64;
-    cnt: int64;
-  public
-    function ToString: shortstring;
-  end;
-  {Using pointer to TStat saves approx. 30-60 seconds for processing 1 billion rows}
-  PStat = ^TStat;
-
-type
-  // Using this dictionary, now approx 4 mins faster than Generics.Collections.TDictionary
-  // THashMap<shortstring, PStat> - takes around 120s.
-  // TFastHash<shortstring, PStat> - takes around 100s.
-  TWeatherDictionary = specialize TFastHashMap<shortstring, PStat>;
-
-type
-  // a type for storing valid lookup temperature
-  TValidTemperatureDictionary = specialize TFastHashMap<shortstring, int64>;
+  , WeatherStation.Common;
 
 type
   // Create a class to encapsulate the temperature observations of each weather station.
@@ -55,8 +31,10 @@ type
     procedure CreateLookupTemp;
     procedure ReadMeasurements;
     procedure ReadMeasurementsBuffered;
-    procedure ParseStationAndTemp(const line: shortstring);
-    procedure AddCityTemperatureLG(const cityName: shortstring; const newTemp: int64);
+    procedure ReadMeasurementsMMT;
+    procedure ProcessChunk(const buffer: TBytes; lineBreakPos: int64);
+    procedure ParseStationAndTemp(const line: string);
+    procedure AddCityTemperatureLG(const cityName: string; const newTemp: int64);
     procedure SortWeatherStationAndStats;
     procedure PrintSortedWeatherStationAndStats;
   public
@@ -66,90 +44,48 @@ type
     procedure ProcessMeasurements;
   end;
 
-
 implementation
-
-{
-  A custom comparer for TStringList.
-
-  The following procedure Written by Székely Balázs for the 1BRC for Object Pascal.
-  URL: https://github.com/gcarreno/1brc-ObjectPascal/tree/main
-}
-function CustomTStringListComparer(AList: TStringList;
-  AIndex1, AIndex2: integer): integer;
-var
-  Pos1, Pos2: integer;
-  Str1, Str2: string;
-begin
-  Result := 0;
-  Str1 := AList.Strings[AIndex1];
-  Str2 := AList.Strings[AIndex2];
-  Pos1 := Pos('=', Str1);
-  Pos2 := Pos('=', Str2);
-  if (Pos1 > 0) and (Pos2 > 0) then
-  begin
-    Str1 := Copy(Str1, 1, Pos1 - 1);
-    Str2 := Copy(Str2, 1, Pos2 - 1);
-    Result := CompareStr(Str1, Str2);
-  end;
-end;
-
-// Remove dots from a string
-function RemoveDots(const line: shortstring): shortstring;
-var
-  index: integer;
-begin
-  Result := line;
-  for index := Length(Result) downto 1 do
-  begin
-    if Result[index] = '.' then
-      Delete(Result, index, 1);
-  end;
-end;
-
-function TStat.ToString: shortstring;
-var
-  minR, meanR, maxR: double; // Store the rounded values prior saving to TStringList.
-begin
-  minR := RoundExDouble(self.min / 10);
-  maxR := RoundExDouble(self.max / 10);
-  meanR := RoundExDouble(self.sum / self.cnt / 10);
-  Result := FormatFloat('0.0', minR) + '/' + FormatFloat('0.0', meanR) +
-    '/' + FormatFloat('0.0', maxR);
-end;
 
 constructor TWeatherStation.Create(const filename: string);
 begin
   // Assign filename
   fname := filename;
+
   // Create a lookup
-  self.lookupStrFloatToIntList := TValidTemperatureDictionary.Create;
+  self.lookupStrFloatToIntList :=
+    Collections.specialize NewKeyValue<string, int64>([kvoThreadSafe, kvoKeyCaseInsensitive]);
+
   // Set expected capacity - saves 10 seconds.
-  self.lookupStrFloatToIntList.Capacity := 44691;
+  self.lookupStrFloatToIntList.Capacity := 2048;
+
   // Create a dictionary
-  weatherDictionary := TWeatherDictionary.Create;
-  weatherDictionary.Capacity := 44691;
+  self.weatherDictionary := Collections.specialize NewKeyValue<string,
+    PStat>([kvoThreadSafe, kvoKeyCaseInsensitive]);
+  self.weatherDictionary.Capacity := 44691;
+
   // Create a TStringList for sorting
   weatherStationList := TStringList.Create;
 end;
 
 destructor TWeatherStation.Destroy;
 var
-  stationName: shortstring;
+  index: int64;
 begin
 
   // Free the lookup dictionary
-  self.lookupStrFloatToIntList.Free;
+  // self.lookupStrFloatToIntList.Free;
+
+
+  // Free the dictionary - 1. Free PStat first
+  for index := 0 to self.weatherDictionary.Count - 1 do
+    Dispose(PStat(self.weatherDictionary.GetValue(index)));
+
+  // Free the dictionary - 2. Finally free the container itself
+  // weatherDictionary.Free;
 
   // Free TStringList dictionary
   weatherStationList.Free;
 
-  // Free the dictionary - 1. Free PStat first
-  for stationName in self.weatherDictionary.Keys do
-    Dispose(PStat(self.weatherDictionary.Items[stationName]));
-
-  // Free the dictionary - 2. Finally free the container itself
-  weatherDictionary.Free;
 end;
 
 procedure TWeatherStation.CreateLookupTemp;
@@ -161,18 +97,19 @@ begin
 
   currentTemp := startTemp;
 
-  while currentTemp <> finishTemp do
+  while currentTemp <= finishTemp do
   begin
     self.lookupStrFloatToIntList.Add(formatfloat('0.0', currentTemp / 10), currentTemp);
     currentTemp := currentTemp + 1;
   end;
 
   {$ifdef DEBUG}
-  for numStr in self.lookupStrFloatToIntList.Keys do
-    WriteLn('We have key: ', numStr, ' with value of: ',
-      IntToStr(self.lookupStrFloatToIntList[numStr]));
-  Writeln(self.lookupStrFloatToIntList.Count);
+   for pair in self.lookupStrFloatToIntList do
+    WriteLn('We have key: ', pair.Key, ' with value of: ', pair.Value);
+
+   Writeln(self.lookupStrFloatToIntList.Count);
   {$endif DEBUG}
+
 end;
 
 procedure TWeatherStation.PrintSortedWeatherStationAndStats;
@@ -209,7 +146,7 @@ end;
 
 procedure TWeatherStation.SortWeatherStationAndStats;
 var
-  wsKey: shortstring;
+  pair: TStationTempPair;
 begin
 
   {$IFDEF DEBUG}
@@ -217,17 +154,16 @@ begin
   WriteLn('Sorting now: ', DateTimeToStr(Now));
   {$ENDIF DEBUG}
 
-  wsKey := '';
-
   if self.weatherDictionary.Count = 0 then
   begin
     WriteLn('Nothing to Sort.');
     Exit;
   end;
 
-  for wsKey in weatherDictionary.Keys do
+  for pair in self.weatherDictionary do
   begin
-    self.weatherStationList.Add(wsKey + '=' + weatherDictionary[wsKey]^.ToString + ', ');
+    // Don't worry about the ', ' at the end. The final printout will take care of it.
+    self.weatherStationList.Add(pair.Key + '=' + pair.Value^.ToString + ', ');
   end;
 
   self.weatherStationList.CustomSort(@CustomTStringListComparer);
@@ -238,7 +174,7 @@ begin
   {$ENDIF DEBUG}
 end;
 
-procedure TWeatherStation.AddCityTemperatureLG(const cityName: shortstring;
+procedure TWeatherStation.AddCityTemperatureLG(const cityName: string;
   const newTemp: int64);
 var
   stat: PStat;
@@ -246,6 +182,7 @@ begin
   // If city name esxists, modify temp as needed
   if self.weatherDictionary.TryGetValue(cityName, stat) then
   begin
+
     // Update min and max temps if needed
     // Re-arranged the if statement, to achieve minimal if checks.
     // This saves approx 15 seconds when processing 1 billion row.
@@ -263,6 +200,7 @@ begin
 
     // Increase the counter
     stat^.cnt := stat^.cnt + 1;
+
 
     // Update the stat of this city
     // self.weatherDictionary.AddOrSetValue(cityName, stat);
@@ -291,25 +229,34 @@ begin
   end;
 end;
 
-procedure TWeatherStation.ParseStationAndTemp(const line: shortstring);
+procedure TWeatherStation.ParseStationAndTemp(const line: string);
 var
   delimiterPos: integer;
   strFloatTemp: shortstring;
-  parsedTemp: int64;
+  parsedTemp: int64 = 0;
+  pair: TLookupPair;
 begin
 
   if length(line) = 0 then Exit;
 
   // Get position of the delimiter
-  delimiterPos := Pos(';', line);
+  delimiterPos := PosFast(';', line);
+
+  {$IFDEF DEBUG}
+  WriteLn('Received: ', line);
+  WriteLn('Delimiter Pos: ', delimiterPos);
+  {$ENDIF DEBUG}
+
   if delimiterPos > 0 then
   begin
+
     // Get the weather station name
     // Using Copy and POS instead of SplitString - as suggested by Gemini AI.
     // This part saves 3 mins faster when processing 1 billion rows.
 
     // No need to create a string
     // parsedStation := Copy(line, 1, delimiterPos - 1);
+
     strFloatTemp := Copy(line, delimiterPos + 1, Length(line));
 
     // Using a lookup value speeds up 30-45 seconds
@@ -335,8 +282,6 @@ begin
       // Read and parse chunks of data until EOF -------------------------------
       while not streamReader.EOF do
       begin
-        //streamReader.ReadLine;
-        //streamReader.ReadLine;
         self.ParseStationAndTemp(streamReader.ReadLine);
         self.ParseStationAndTemp(streamReader.ReadLine);
       end;// End of read and parse chunks of data ------------------------------
@@ -350,19 +295,128 @@ begin
 end;
 
 
-procedure TWeatherStation.ReadMeasurementsBuffered;
+procedure TWeatherStation.ProcessChunk(const buffer: TBytes; lineBreakPos: int64);
 var
-  mmapText:TMemoryMapText;
-  index:int64;
-
+  strStream: TStringStream;
+  streamReader: TStreamReader;
+  chunkBytes: TBytes;
 begin
 
-  mmapText := TMemoryMapText.Create(self.fname);
-
-  for index:=0 to mmapText.Count-1 do
+  // Check if lineBreakPos is within bounds
+  if (lineBreakPos > 0) and (lineBreakPos <= Length(buffer)) then
   begin
-    self.ParseStationAndTemp(mmapText.Strings[index]);
+    // Copy the portion of buffer from 0 to lineBreakPos into chunkBytes
+    SetLength(chunkBytes, lineBreakPos);
+    Move(buffer[0], chunkBytes[0], lineBreakPos);
+
+    // Create a TStringStream with the chunkBytes
+    strStream := TStringStream.Create(chunkBytes);
+    try
+      streamReader := TStreamReader.Create(strStream);
+      try
+        while not streamReader.EndOfStream do
+        begin
+          self.ParseStationAndTemp(streamReader.ReadLine);
+        end;
+
+      finally
+        streamReader.Free;
+      end;
+
+    finally
+      strStream.Free;
+    end;
+  end
+  else
+  begin
+    WriteLn('Invalid lineBreakPos:', lineBreakPos);
   end;
+end;
+
+
+procedure TWeatherStation.ReadMeasurementsBuffered;
+const
+  defaultChunkSize = 8388608;
+var
+  fileStream: TBufferedFileStream;
+  buffer: TBytes;
+  bytesRead, totalBytesRead, chunkSize, lineBreakPos, chunkIndex: int64;
+begin
+
+  chunkSize := defaultChunkSize * 1;
+
+  // Open the file for reading
+  fileStream := TBufferedFileStream.Create(self.fname, fmOpenRead);
+  try
+    // Allocate memory buffer for reading chunks
+    SetLength(buffer, chunkSize);
+    try
+      totalBytesRead := 0;
+      chunkIndex := 0;
+
+      // Read and parse chunks of data until EOF
+      while totalBytesRead < fileStream.Size do
+      begin
+        bytesRead := fileStream.Read(buffer[0], chunkSize);
+        Inc(totalBytesRead, bytesRead);
+
+        // Find the position of the last newline character in the chunk
+        lineBreakPos := BytesRead;
+        while (lineBreakPos > 0) and (Buffer[lineBreakPos - 1] <> Ord(#10)) do
+          Dec(lineBreakPos);
+
+        { Now, must ensure that if the last byte read in the current chunk
+          is not a newline character, the file pointer is moved back to include
+          that byte and any preceding bytes of the partial line in the next
+          chunk's read operation.
+
+          Also, no need to update the BytesRead variable in this context because
+          it represents the actual number of bytes read from the file, including
+          any partial line that may have been included due to moving the file
+          pointer back.
+          Ref: https://www.freepascal.org/docs-html/rtl/classes/tstream.seek.html}
+        if lineBreakPos < bytesRead then
+          fileStream.Seek(-(bytesRead - lineBreakPos), soCurrent);
+
+        // Process the chunk
+        self.ProcessChunk(buffer, lineBreakPos);
+
+        // Display user feedback
+        WriteLn('Chunk ', chunkIndex, ', Total bytes read:', IntToStr(totalBytesRead));
+
+        // Increase chunk index - a counter
+        Inc(chunkIndex);
+      end;
+    finally
+      // No need to free TBytes.
+    end;
+  finally
+    // Close the file
+    fileStream.Free;
+  end;
+end;
+
+
+procedure TWeatherStation.ReadMeasurementsMMT;
+var
+  mmt: TMemoryMapText;
+  index, lineCount: int64;
+begin
+
+  mmt := TMemoryMapText.Create(self.fname);
+  try
+
+    lineCount := mmt.Count;
+
+    for index := 0 to lineCount - 1 do
+    begin
+      self.ParseStationAndTemp(mmt.Lines[index]);
+    end;
+
+  finally
+    mmt.Free;
+  end;
+
 end;
 
 
@@ -370,8 +424,9 @@ end;
 procedure TWeatherStation.ProcessMeasurements;
 begin
   self.CreateLookupTemp;
-  //self.ReadMeasurements;
-  self.ReadMeasurementsBuffered;
+  self.ReadMeasurements;
+  //self.ReadMeasurementsBuffered;
+  //self.ReadMeasurementsMMT;
   self.SortWeatherStationAndStats;
   self.PrintSortedWeatherStationAndStats;
 end;
